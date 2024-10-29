@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::ops;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) use anyhow::{Context as _, Result};
 use thiserror::Error as ThisError;
@@ -120,22 +121,23 @@ impl<'a> Display for Notification<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct Context {
     root_directory: PathBuf,
     pub dist_server: String,
-    notify_handler: Box<dyn Fn(Notification<'_>)>,
+    notify_handler: Arc<dyn Fn(Notification<'_>) + Send + Sync>,
 }
 
 impl Context {
     pub fn new(
         root_directory: PathBuf,
         dist_server: &str,
-        notify_handler: Box<dyn Fn(Notification<'_>)>,
+        notify_handler: Box<dyn Fn(Notification<'_>) + Send + Sync>,
     ) -> Self {
         Self {
             root_directory,
             dist_server: dist_server.to_owned(),
-            notify_handler,
+            notify_handler: Arc::from(notify_handler),
         }
     }
 

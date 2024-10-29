@@ -1,6 +1,9 @@
 #[cfg(windows)]
 use std::fs;
-use std::{convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, path::Path, process::Command};
+use std::{
+    convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, path::Path, process::Command,
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 #[cfg(windows)]
@@ -35,15 +38,14 @@ pub(crate) struct DistributableToolchain<'a> {
 impl<'a> DistributableToolchain<'a> {
     pub(crate) fn from_partial(
         toolchain: Option<PartialToolchainDesc>,
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
     ) -> anyhow::Result<Self> {
         Ok(Self::try_from(&cfg.toolchain_from_partial(toolchain)?)?)
     }
 
-    pub(crate) fn new(cfg: &'a Cfg<'a>, desc: ToolchainDesc) -> Result<Self, RustupError> {
+    pub(crate) fn new(cfg: &'a Cfg, desc: ToolchainDesc) -> Result<Self, RustupError> {
         Toolchain::new(cfg, (&desc).into()).map(|toolchain| Self { toolchain, desc })
     }
-
     pub(crate) fn desc(&self) -> &ToolchainDesc {
         &self.desc
     }
@@ -102,9 +104,11 @@ impl<'a> DistributableToolchain<'a> {
             remove_components: vec![],
         };
 
+        let handler = self.toolchain.cfg.notify_handler.clone();
         let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+            &|n: crate::dist::Notification<'_>| (handler)(n.into());
+        //let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+        let download_cfg = self.toolchain.cfg.download_cfg_v2();
 
         manifestation
             .update(
@@ -114,6 +118,7 @@ impl<'a> DistributableToolchain<'a> {
                 &download_cfg,
                 &self.desc.manifest_name(),
                 false,
+                notify_handler
             )
             .await?;
 
@@ -327,7 +332,7 @@ impl<'a> DistributableToolchain<'a> {
 
     #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
     pub(crate) async fn install(
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
         toolchain: &ToolchainDesc,
         components: &[&str],
         targets: &[&str],
@@ -342,7 +347,8 @@ impl<'a> DistributableToolchain<'a> {
             toolchain,
             profile,
             update_hash,
-            dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
+            //dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
+            dl_cfg: cfg.download_cfg_v2(),
             force,
             allow_downgrade: false,
             exists: false,
@@ -400,7 +406,8 @@ impl<'a> DistributableToolchain<'a> {
             toolchain: &self.desc,
             profile,
             update_hash,
-            dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
+            //dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
+            dl_cfg: cfg.download_cfg_v2(),
             force,
             allow_downgrade,
             exists: true,
@@ -492,9 +499,11 @@ impl<'a> DistributableToolchain<'a> {
             remove_components: vec![component],
         };
 
+        let handler = self.toolchain.cfg.notify_handler.clone();
         let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+            &|n: crate::dist::Notification<'_>| (handler)(n.into());
+        //let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+        let download_cfg = self.toolchain.cfg.download_cfg_v2();
 
         manifestation
             .update(
@@ -504,23 +513,51 @@ impl<'a> DistributableToolchain<'a> {
                 &download_cfg,
                 &self.desc.manifest_name(),
                 false,
+                notify_handler
             )
             .await?;
 
         Ok(())
     }
 
-    pub async fn show_dist_version(&self) -> anyhow::Result<Option<String>> {
+    pub async fn show_dist_version_v2(&self) -> anyhow::Result<Option<String>> {
         let update_hash = self.toolchain.cfg.get_hash_file(&self.desc, false)?;
-        let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+        let handler = self.toolchain.cfg.notify_handler.clone();
+        let desc = self.desc.clone();
 
-        match crate::dist::dl_v2_manifest(download_cfg, Some(&update_hash), &self.desc).await? {
-            Some((manifest, _)) => Ok(Some(manifest.get_rust_version()?.to_string())),
-            None => Ok(None),
+        let download_cfg = self.toolchain.cfg.download_cfg_v2();
+
+        let down_cfg = Arc::new(download_cfg);
+        let man_url = desc.manifest_v2_url(&down_cfg.dist_root, &down_cfg.process);
+        let h = tokio::task::spawn(async move {
+            let notify_handler =
+                |n: crate::dist::Notification<'_>| (handler)(n.into());
+            crate::dist::dl_v3_manifest(
+                down_cfg,
+                Some(&update_hash.clone()),
+                man_url.clone(),
+                &notify_handler,
+            ).await
+        });
+
+        match h.await.unwrap() {
+            Ok(Some((manifest, _))) => Ok(Some(manifest.get_rust_version()?.to_string())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     }
+
+    //pub async fn show_dist_version(&self) -> anyhow::Result<Option<String>> {
+    //    let update_hash = self.toolchain.cfg.get_hash_file(&self.desc, false)?;
+    //    let notify_handler =
+    //        &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
+    //    let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
+
+    //    match crate::dist::dl_v2_manifest(download_cfg, Some(&update_hash), &self.desc).await? {
+    //        Some((manifest, _)) => Ok(Some(manifest.get_rust_version()?.to_string())),
+    //        None => Ok(None),
+    //    }
+    //}
 
     pub fn show_version(&self) -> anyhow::Result<Option<String>> {
         match self.get_manifestation()?.load_manifest()? {

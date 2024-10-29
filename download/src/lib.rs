@@ -46,13 +46,13 @@ pub enum Event<'a> {
     DownloadDataReceived(&'a [u8]),
 }
 
-type DownloadCallback<'a> = &'a dyn Fn(Event<'_>) -> Result<()>;
+type DownloadCallback<'a> = &'a (dyn Fn(Event<'_>) -> Result<()> + Send + Sync);
 
 async fn download_with_backend(
     backend: Backend,
     url: &Url,
     resume_from: u64,
-    callback: DownloadCallback<'_>,
+    callback: &(dyn Fn(Event<'_>) -> Result<()> + Send + Sync) //DownloadCallback<'_>,
 ) -> Result<()> {
     match backend {
         Backend::Curl => curl::download(url, resume_from, callback),
@@ -65,7 +65,7 @@ pub async fn download_to_path_with_backend(
     url: &Url,
     path: &Path,
     resume_from_partial: bool,
-    callback: Option<DownloadCallback<'_>>,
+    callback: Option<&(dyn Fn(Event<'_>) -> Result<()> + Send + Sync)> //Option<DownloadCallback<'_>>,
 ) -> Result<()> {
     let Err(err) =
         download_to_path_with_backend_(backend, url, path, resume_from_partial, callback).await
@@ -88,11 +88,12 @@ pub async fn download_to_path_with_backend_(
     url: &Url,
     path: &Path,
     resume_from_partial: bool,
-    callback: Option<DownloadCallback<'_>>,
+    callback: Option<&(dyn Fn(Event<'_>) -> Result<()> + Send + Sync)> //Option<DownloadCallback<'_>>,
 ) -> Result<()> {
-    use std::cell::RefCell;
+    //use std::cell::RefCell;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::{Arc, Mutex};
 
     let (file, resume_from) = if resume_from_partial {
         // TODO: blocking call
@@ -145,15 +146,18 @@ pub async fn download_to_path_with_backend_(
         )
     };
 
-    let file = RefCell::new(file);
+    //let file = RefCell::new(file);
+    let file = Arc::new(Mutex::new(file));
 
     // TODO: the sync callback will stall the async runtime if IO calls block, which is OS dependent. Rearrange.
     download_with_backend(backend, url, resume_from, &|event| {
         if let Event::DownloadDataReceived(data) = event {
-            file.borrow_mut()
+            file.lock()
+                .unwrap()
                 .write_all(data)
-                .context("unable to write download to disk")?;
-        }
+                .context("unable to write download to disk")
+                .unwrap()
+        };
         match callback {
             Some(cb) => cb(event),
             None => Ok(()),
@@ -161,9 +165,11 @@ pub async fn download_to_path_with_backend_(
     })
     .await?;
 
-    file.borrow_mut()
+    file.lock()
+        .unwrap()
         .sync_data()
-        .context("unable to sync download to disk")?;
+        .context("unable to sync download to disk")
+        .unwrap();
 
     Ok::<(), anyhow::Error>(())
 }
@@ -312,7 +318,7 @@ pub mod reqwest_be {
     pub async fn download(
         url: &Url,
         resume_from: u64,
-        callback: &dyn Fn(Event<'_>) -> Result<()>,
+        callback: &(dyn Fn(Event<'_>) -> Result<()> + Send + Sync),
         tls: TlsBackend,
     ) -> Result<()> {
         // Short-circuit reqwest for the "file:" URL scheme
@@ -428,7 +434,7 @@ pub mod reqwest_be {
     fn download_from_file_url(
         url: &Url,
         resume_from: u64,
-        callback: &dyn Fn(Event<'_>) -> Result<()>,
+        callback: &(dyn Fn(Event<'_>) -> Result<()> + Send + Sync),
     ) -> Result<bool> {
         use std::fs;
 

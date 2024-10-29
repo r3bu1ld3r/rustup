@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Error, Result};
 use clap::{builder::PossibleValue, Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -581,10 +582,10 @@ pub async fn main(
 
     update_console_filter(process, &console_filter, matches.quiet, matches.verbose);
 
-    let cfg = &mut common::set_globals(current_dir, matches.quiet, process)?;
+    let mut cfg = Arc::new(common::set_globals(current_dir, matches.quiet, process)?);
 
     if let Some(t) = &matches.plus_toolchain {
-        cfg.set_toolchain_override(t);
+        Arc::get_mut(&mut cfg).map(|cfg| cfg.set_toolchain_override(t));
     }
 
     let Some(subcmd) = matches.subcmd else {
@@ -595,11 +596,11 @@ pub async fn main(
     match subcmd {
         RustupSubcmd::DumpTestament => common::dump_testament(process),
         RustupSubcmd::Install { opts } => update(cfg, opts, true).await,
-        RustupSubcmd::Uninstall { opts } => toolchain_remove(cfg, opts),
+        RustupSubcmd::Uninstall { opts } => toolchain_remove(Arc::get_mut(&mut cfg).take().unwrap(), opts),
         RustupSubcmd::Show { verbose, subcmd } => handle_epipe(match subcmd {
-            None => show(cfg, verbose),
-            Some(ShowSubcmd::ActiveToolchain { verbose }) => show_active_toolchain(cfg, verbose),
-            Some(ShowSubcmd::Home) => show_rustup_home(cfg),
+            None => show(&cfg, verbose),
+            Some(ShowSubcmd::ActiveToolchain { verbose }) => show_active_toolchain(&cfg, verbose),
+            Some(ShowSubcmd::Home) => show_rustup_home(&cfg),
             Some(ShowSubcmd::Profile) => {
                 writeln!(process.stdout().lock(), "{}", cfg.get_profile()?)?;
                 Ok(ExitCode(0))
@@ -627,27 +628,30 @@ pub async fn main(
         RustupSubcmd::Toolchain { subcmd } => match subcmd {
             ToolchainSubcmd::Install { opts } => update(cfg, opts, true).await,
             ToolchainSubcmd::List { verbose, quiet } => {
-                handle_epipe(common::list_toolchains(cfg, verbose, quiet))
+                handle_epipe(common::list_toolchains(&cfg, verbose, quiet))
             }
             ToolchainSubcmd::Link { toolchain, path } => {
-                toolchain_link(cfg, &toolchain, &path).await
+                toolchain_link(&cfg, &toolchain, &path).await
             }
-            ToolchainSubcmd::Uninstall { opts } => toolchain_remove(cfg, opts),
+            ToolchainSubcmd::Uninstall { opts } => toolchain_remove(Arc::get_mut(&mut cfg).unwrap(), opts),
         },
-        RustupSubcmd::Check => check_updates(cfg).await,
+        RustupSubcmd::Check => {
+            check_updates_v2(cfg).await
+            //check_updates(&cfg).await
+        }
         RustupSubcmd::Default {
             toolchain,
             force_non_host,
-        } => default_(cfg, toolchain, force_non_host).await,
+        } => default_(&cfg, toolchain, force_non_host).await,
         RustupSubcmd::Target { subcmd } => match subcmd {
             TargetSubcmd::List {
                 toolchain,
                 installed,
                 quiet,
-            } => handle_epipe(target_list(cfg, toolchain, installed, quiet).await),
-            TargetSubcmd::Add { target, toolchain } => target_add(cfg, target, toolchain).await,
+            } => handle_epipe(target_list(&cfg, toolchain, installed, quiet).await),
+            TargetSubcmd::Add { target, toolchain } => target_add(&cfg, target, toolchain).await,
             TargetSubcmd::Remove { target, toolchain } => {
-                target_remove(cfg, target, toolchain).await
+                target_remove(&cfg, target, toolchain).await
             }
         },
         RustupSubcmd::Component { subcmd } => match subcmd {
@@ -655,45 +659,45 @@ pub async fn main(
                 toolchain,
                 installed,
                 quiet,
-            } => handle_epipe(component_list(cfg, toolchain, installed, quiet).await),
+            } => handle_epipe(component_list(&cfg, toolchain, installed, quiet).await),
             ComponentSubcmd::Add {
                 component,
                 toolchain,
                 target,
-            } => component_add(cfg, component, toolchain, target).await,
+            } => component_add(&cfg, component, toolchain, target).await,
             ComponentSubcmd::Remove {
                 component,
                 toolchain,
                 target,
-            } => component_remove(cfg, component, toolchain, target).await,
+            } => component_remove(&cfg, component, toolchain, target).await,
         },
         RustupSubcmd::Override { subcmd } => match subcmd {
-            OverrideSubcmd::List => handle_epipe(common::list_overrides(cfg)),
+            OverrideSubcmd::List => handle_epipe(common::list_overrides(&cfg)),
             OverrideSubcmd::Set { toolchain, path } => {
-                override_add(cfg, toolchain, path.as_deref()).await
+                override_add(&cfg, toolchain, path.as_deref()).await
             }
             OverrideSubcmd::Unset { path, nonexistent } => {
-                override_remove(cfg, path.as_deref(), nonexistent)
+                override_remove(&cfg, path.as_deref(), nonexistent)
             }
         },
         RustupSubcmd::Run {
             toolchain,
             command,
             install,
-        } => run(cfg, toolchain, command, install)
+        } => run(&cfg, toolchain, command, install)
             .await
             .map(ExitCode::from),
-        RustupSubcmd::Which { command, toolchain } => which(cfg, &command, toolchain).await,
+        RustupSubcmd::Which { command, toolchain } => which(&cfg, &command, toolchain).await,
         RustupSubcmd::Doc {
             path,
             toolchain,
             topic,
             page,
-        } => doc(cfg, path, toolchain, topic.as_deref(), &page).await,
+        } => doc(&cfg, path, toolchain, topic.as_deref(), &page).await,
         #[cfg(not(windows))]
-        RustupSubcmd::Man { command, toolchain } => man(cfg, &command, toolchain).await,
+        RustupSubcmd::Man { command, toolchain } => man(&cfg, &command, toolchain).await,
         RustupSubcmd::Self_ { subcmd } => match subcmd {
-            SelfSubcmd::Update => self_update::update(cfg).await,
+            SelfSubcmd::Update => self_update::update(&cfg).await,
             SelfSubcmd::Uninstall { no_prompt } => self_update::uninstall(no_prompt, process),
             SelfSubcmd::UpgradeData => cfg.upgrade_data().map(|_| ExitCode(0)),
         },
@@ -702,11 +706,11 @@ pub async fn main(
                 .set_default_host_triple(host_triple)
                 .map(|_| utils::ExitCode(0)),
             SetSubcmd::Profile { profile_name } => {
-                cfg.set_profile(profile_name).map(|_| utils::ExitCode(0))
+                Arc::get_mut(&mut cfg).map(|cfg| cfg.set_profile(profile_name).map(|_| utils::ExitCode(0))).unwrap()
             }
             SetSubcmd::AutoSelfUpdate {
                 auto_self_update_mode,
-            } => set_auto_self_update(cfg, auto_self_update_mode),
+            } => set_auto_self_update(Arc::get_mut(&mut cfg).unwrap(), auto_self_update_mode),
         },
         RustupSubcmd::Completions { shell, command } => {
             output_completion_script(shell, command, process)
@@ -715,11 +719,11 @@ pub async fn main(
 }
 
 async fn default_(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     toolchain: Option<MaybeResolvableToolchainName>,
     force_non_host: bool,
 ) -> Result<utils::ExitCode> {
-    common::warn_if_host_is_emulated(cfg.process);
+    common::warn_if_host_is_emulated(&cfg.process);
 
     if let Some(toolchain) = toolchain {
         match toolchain.to_owned() {
@@ -765,16 +769,24 @@ async fn default_(
     Ok(utils::ExitCode(0))
 }
 
-async fn check_updates(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
-    let mut t = cfg.process.stdout().terminal(cfg.process);
-    let channels = cfg.list_channels()?;
+async fn check_updates_v2(cfg: Arc<Cfg>) -> Result<utils::ExitCode> {
+    let mut t = cfg.process.stdout().terminal(&cfg.process);
+    let channels = cfg.list_channels_v2()?;
+    
+    let mut tasks = vec![];
 
     for channel in channels {
         let (name, distributable) = channel;
         let current_version = distributable.show_version()?;
-        let dist_version = distributable.show_dist_version().await?;
+        let dist_version = distributable.show_dist_version_v2().await?;
+        tasks.push((name, current_version, dist_version));
+    }
+    
+    
+    for (name, current_version, dist_version) in tasks {
         let _ = t.attr(terminalsource::Attr::Bold);
         write!(t.lock(), "{name} - ")?;
+        let dist_version = dist_version;
         match (current_version, dist_version) {
             (None, None) => {
                 let _ = t.fg(terminalsource::Color::Red);
@@ -801,19 +813,60 @@ async fn check_updates(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
         }
     }
 
-    check_rustup_update(cfg.process).await?;
+    check_rustup_update(&cfg.process).await?;
 
     Ok(utils::ExitCode(0))
 }
 
+//async fn check_updates(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
+//    let mut t = cfg.process.stdout().terminal(cfg.process);
+//    let channels = cfg.list_channels()?;
+//
+//    for channel in channels {
+//        let (name, distributable) = channel;
+//        let current_version = distributable.show_version()?;
+//        let dist_version = distributable.show_dist_version().await?;
+//        let _ = t.attr(terminalsource::Attr::Bold);
+//        write!(t.lock(), "{name} - ")?;
+//        match (current_version, dist_version) {
+//            (None, None) => {
+//                let _ = t.fg(terminalsource::Color::Red);
+//                writeln!(t.lock(), "Cannot identify installed or update versions")?;
+//            }
+//            (Some(cv), None) => {
+//                let _ = t.fg(terminalsource::Color::Green);
+//                write!(t.lock(), "Up to date")?;
+//                let _ = t.reset();
+//                writeln!(t.lock(), " : {cv}")?;
+//            }
+//            (Some(cv), Some(dv)) => {
+//                let _ = t.fg(terminalsource::Color::Yellow);
+//                write!(t.lock(), "Update available")?;
+//                let _ = t.reset();
+//                writeln!(t.lock(), " : {cv} -> {dv}")?;
+//            }
+//            (None, Some(dv)) => {
+//                let _ = t.fg(terminalsource::Color::Yellow);
+//                write!(t.lock(), "Update available")?;
+//                let _ = t.reset();
+//                writeln!(t.lock(), " : (Unknown version) -> {dv}")?;
+//            }
+//        }
+//    }
+//
+//    check_rustup_update(cfg.process).await?;
+//
+//    Ok(utils::ExitCode(0))
+//}
+
 async fn update(
-    cfg: &mut Cfg<'_>,
+    mut cfg: Arc<Cfg>,
     opts: UpdateOpts,
     ensure_active_toolchain: bool,
 ) -> Result<utils::ExitCode> {
     let mut exit_code = utils::ExitCode(0);
 
-    common::warn_if_host_is_emulated(cfg.process);
+    common::warn_if_host_is_emulated(&cfg.process);
     let self_update_mode = cfg.get_self_update_mode()?;
     // Priority: no-self-update feature > self_update_mode > no-self-update args.
     // Update only if rustup does **not** have the no-self-update feature,
@@ -824,7 +877,7 @@ async fn update(
         && !opts.no_self_update;
     let force_non_host = opts.force_non_host;
     if let Some(p) = opts.profile {
-        cfg.set_profile_override(p);
+        Arc::get_mut(&mut cfg).map(|cfg| cfg.set_profile_override(p));
     }
     let cfg = &cfg;
     if cfg.get_profile()? == Profile::Complete {
@@ -835,7 +888,7 @@ async fn update(
         for name in names {
             // This needs another pass to fix it all up
             if name.has_triple() {
-                let host_arch = TargetTriple::from_host_or_build(cfg.process);
+                let host_arch = TargetTriple::from_host_or_build(&cfg.process);
                 let target_triple = name.clone().resolve(&host_arch)?.target;
                 common::check_non_host_toolchain(
                     name.to_string(),
@@ -883,7 +936,7 @@ async fn update(
             }
         }
         if self_update {
-            exit_code &= common::self_update(|| Ok(()), cfg.process).await?;
+            exit_code &= common::self_update(|| Ok(()), &cfg.process).await?;
         }
     } else if ensure_active_toolchain {
         let (toolchain, reason) = cfg
@@ -899,7 +952,7 @@ async fn update(
     }
 
     if !self_update::NEVER_SELF_UPDATE && self_update_mode == SelfUpdateMode::CheckOnly {
-        check_rustup_update(cfg.process).await?;
+        check_rustup_update(&cfg.process).await?;
     }
 
     if self_update::NEVER_SELF_UPDATE {
@@ -911,7 +964,7 @@ async fn update(
 }
 
 async fn run(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     toolchain: ResolvableLocalToolchainName,
     command: Vec<String>,
     install: bool,
@@ -923,7 +976,7 @@ async fn run(
 }
 
 async fn which(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     binary: &str,
     toolchain: Option<ResolvableToolchainName>,
 ) -> Result<utils::ExitCode> {
@@ -936,12 +989,12 @@ async fn which(
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
-fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
-    common::warn_if_host_is_emulated(cfg.process);
+fn show(cfg: &Cfg, verbose: bool) -> Result<utils::ExitCode> {
+    common::warn_if_host_is_emulated(&cfg.process);
 
     // Print host triple
     {
-        let mut t = cfg.process.stdout().terminal(cfg.process);
+        let mut t = cfg.process.stdout().terminal(&cfg.process);
         t.attr(terminalsource::Attr::Bold)?;
         write!(t.lock(), "Default host: ")?;
         t.reset()?;
@@ -950,7 +1003,7 @@ fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
 
     // Print rustup home directory
     {
-        let mut t = cfg.process.stdout().terminal(cfg.process);
+        let mut t = cfg.process.stdout().terminal(&cfg.process);
         t.attr(terminalsource::Attr::Bold)?;
         write!(t.lock(), "rustup home:  ")?;
         t.reset()?;
@@ -991,7 +1044,7 @@ fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
 
     // show installed toolchains
     {
-        let mut t = cfg.process.stdout().terminal(cfg.process);
+        let mut t = cfg.process.stdout().terminal(&cfg.process);
 
         print_header::<Error>(&mut t, "installed toolchains")?;
 
@@ -1029,7 +1082,7 @@ fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
 
     // show active toolchain
     {
-        let mut t = cfg.process.stdout().terminal(cfg.process);
+        let mut t = cfg.process.stdout().terminal(&cfg.process);
 
         writeln!(t.lock())?;
 
@@ -1077,7 +1130,7 @@ fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
-fn show_active_toolchain(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
+fn show_active_toolchain(cfg: &Cfg, verbose: bool) -> Result<utils::ExitCode> {
     match cfg.find_active_toolchain()? {
         Some((toolchain_name, reason)) => {
             let toolchain = Toolchain::with_reason(cfg, toolchain_name.clone(), &reason)?;
@@ -1104,13 +1157,13 @@ fn show_active_toolchain(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
-fn show_rustup_home(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
+fn show_rustup_home(cfg: &Cfg) -> Result<utils::ExitCode> {
     writeln!(cfg.process.stdout().lock(), "{}", cfg.rustup_dir.display())?;
     Ok(utils::ExitCode(0))
 }
 
 async fn target_list(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     toolchain: Option<PartialToolchainDesc>,
     installed_only: bool,
     quiet: bool,
@@ -1129,12 +1182,12 @@ async fn target_list(
         },
         installed_only,
         quiet,
-        cfg.process,
+        &cfg.process,
     )
 }
 
 async fn target_add(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     mut targets: Vec<String>,
     toolchain: Option<PartialToolchainDesc>,
 ) -> Result<utils::ExitCode> {
@@ -1183,7 +1236,7 @@ async fn target_add(
 }
 
 async fn target_remove(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     targets: Vec<String>,
     toolchain: Option<PartialToolchainDesc>,
 ) -> Result<utils::ExitCode> {
@@ -1217,7 +1270,7 @@ async fn target_remove(
 }
 
 async fn component_list(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     toolchain: Option<PartialToolchainDesc>,
     installed_only: bool,
     quiet: bool,
@@ -1229,12 +1282,12 @@ async fn component_list(
         |c| Some(&c.name),
         installed_only,
         quiet,
-        cfg.process,
+        &cfg.process,
     )
 }
 
 async fn component_add(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     components: Vec<String>,
     toolchain: Option<PartialToolchainDesc>,
     target: Option<String>,
@@ -1260,7 +1313,7 @@ fn get_target(
 }
 
 async fn component_remove(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     components: Vec<String>,
     toolchain: Option<PartialToolchainDesc>,
     target: Option<String>,
@@ -1277,7 +1330,7 @@ async fn component_remove(
 }
 
 async fn toolchain_link(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     dest: &CustomToolchainName,
     src: &Path,
 ) -> Result<utils::ExitCode> {
@@ -1307,7 +1360,7 @@ async fn toolchain_link(
     Ok(utils::ExitCode(0))
 }
 
-fn toolchain_remove(cfg: &mut Cfg<'_>, opts: UninstallOpts) -> Result<utils::ExitCode> {
+fn toolchain_remove(cfg: &mut Cfg, opts: UninstallOpts) -> Result<utils::ExitCode> {
     let default_toolchain = cfg.get_default().ok().flatten();
     let active_toolchain = cfg.find_active_toolchain().ok().flatten().map(|(it, _)| it);
 
@@ -1333,7 +1386,7 @@ fn toolchain_remove(cfg: &mut Cfg<'_>, opts: UninstallOpts) -> Result<utils::Exi
 }
 
 async fn override_add(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     toolchain: ResolvableToolchainName,
     path: Option<&Path>,
 ) -> Result<utils::ExitCode> {
@@ -1363,7 +1416,7 @@ async fn override_add(
 }
 
 fn override_remove(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     path: Option<&Path>,
     nonexistent: bool,
 ) -> Result<utils::ExitCode> {
@@ -1460,7 +1513,7 @@ docs_data![
 ];
 
 async fn doc(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     path_only: bool,
     toolchain: Option<PartialToolchainDesc>,
     mut topic: Option<&str>,
@@ -1523,7 +1576,7 @@ async fn doc(
 
 #[cfg(not(windows))]
 async fn man(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     command: &str,
     toolchain: Option<PartialToolchainDesc>,
 ) -> Result<utils::ExitCode> {
@@ -1545,7 +1598,7 @@ async fn man(
 }
 
 fn set_auto_self_update(
-    cfg: &mut Cfg<'_>,
+    cfg: &mut Cfg,
     auto_self_update_mode: SelfUpdateMode,
 ) -> Result<utils::ExitCode> {
     if self_update::NEVER_SELF_UPDATE {

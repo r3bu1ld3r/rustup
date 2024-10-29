@@ -5,6 +5,7 @@
 mod tests;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio_retry::{strategy::FixedInterval, RetryIf};
@@ -106,12 +107,13 @@ impl Manifestation {
         new_manifest: &Manifest,
         changes: Changes,
         force_update: bool,
-        download_cfg: &DownloadCfg<'_>,
+        download_cfg: &DownloadCfg,
         toolchain_str: &str,
         implicit_modify: bool,
+        notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync)
     ) -> Result<UpdateStatus> {
         // Some vars we're going to need a few times
-        let tmp_cx = download_cfg.tmp_cx;
+        let tmp_cx = &download_cfg.tmp_cx;
         let prefix = self.installation.prefix();
         let rel_installed_manifest_path = prefix.rel_manifest_file(DIST_MANIFEST);
         let installed_manifest_path = prefix.path().join(&rel_installed_manifest_path);
@@ -123,7 +125,7 @@ impl Manifestation {
             new_manifest,
             &changes,
             &config,
-            &download_cfg.notify_handler,
+            notify_handler,
         )?;
 
         if update.nothing_changes() {
@@ -139,7 +141,7 @@ impl Manifestation {
                 e.downcast::<RustupError>()
             {
                 for component in &components {
-                    (download_cfg.notify_handler)(Notification::ForcingUnavailableComponent(
+                    (notify_handler)(Notification::ForcingUnavailableComponent(
                         &component.name(new_manifest),
                     ));
                 }
@@ -163,7 +165,7 @@ impl Manifestation {
             .unwrap_or(DEFAULT_MAX_RETRIES);
 
         for (component, format, url, hash) in components {
-            (download_cfg.notify_handler)(Notification::DownloadingComponent(
+            (notify_handler)(Notification::DownloadingComponent(
                 &component.short_name(new_manifest),
                 &self.target_triple,
                 component.target.as_ref(),
@@ -178,13 +180,13 @@ impl Manifestation {
 
             let downloaded_file = RetryIf::spawn(
                 FixedInterval::from_millis(0).take(max_retries),
-                || download_cfg.download(&url_url, &hash),
+                || download_cfg.download(&url_url, &hash, notify_handler),
                 |e: &anyhow::Error| {
                     // retry only known retriable cases
                     match e.downcast_ref::<RustupError>() {
                         Some(RustupError::BrokenPartialFile)
                         | Some(RustupError::DownloadingFile { .. }) => {
-                            (download_cfg.notify_handler)(Notification::RetryingDownload(&url));
+                            (notify_handler)(Notification::RetryingDownload(&url));
                             true
                         }
                         _ => false,
@@ -202,14 +204,14 @@ impl Manifestation {
         // Begin transaction
         let mut tx = Transaction::new(
             prefix.clone(),
-            tmp_cx,
-            download_cfg.notify_handler,
-            download_cfg.process,
+            &tmp_cx,
+            notify_handler,
+            &download_cfg.process,
         );
 
         // If the previous installation was from a v1 manifest we need
         // to uninstall it first.
-        tx = self.maybe_handle_v2_upgrade(&config, tx, download_cfg.process)?;
+        tx = self.maybe_handle_v2_upgrade(&config, tx, &download_cfg.process)?;
 
         // Uninstall components
         for component in &update.components_to_uninstall {
@@ -218,7 +220,7 @@ impl Manifestation {
             } else {
                 Notification::RemovingComponent
             };
-            (download_cfg.notify_handler)(notification(
+            (notify_handler)(notification(
                 &component.short_name(new_manifest),
                 &self.target_triple,
                 component.target.as_ref(),
@@ -228,8 +230,8 @@ impl Manifestation {
                 component,
                 new_manifest,
                 tx,
-                &download_cfg.notify_handler,
-                download_cfg.process,
+                notify_handler,
+                &download_cfg.process,
             )?;
         }
 
@@ -243,14 +245,14 @@ impl Manifestation {
             let short_pkg_name = component.short_name_in_manifest();
             let short_name = component.short_name(new_manifest);
 
-            (download_cfg.notify_handler)(Notification::InstallingComponent(
+            (notify_handler)(Notification::InstallingComponent(
                 &short_name,
                 &self.target_triple,
                 component.target.as_ref(),
             ));
 
             let notification_converter = |notification: crate::utils::Notification<'_>| {
-                (download_cfg.notify_handler)(notification.into());
+                (notify_handler)(notification.into());
             };
             let gz;
             let xz;
@@ -261,27 +263,27 @@ impl Manifestation {
                 CompressionKind::GZip => {
                     gz = TarGzPackage::new(
                         reader,
-                        tmp_cx,
+                        &tmp_cx,
                         Some(&notification_converter),
-                        download_cfg.process,
+                        &download_cfg.process,
                     )?;
                     &gz
                 }
                 CompressionKind::XZ => {
                     xz = TarXzPackage::new(
                         reader,
-                        tmp_cx,
+                        &tmp_cx,
                         Some(&notification_converter),
-                        download_cfg.process,
+                        &download_cfg.process,
                     )?;
                     &xz
                 }
                 CompressionKind::ZStd => {
                     zst = TarZStdPackage::new(
                         reader,
-                        tmp_cx,
+                        &tmp_cx,
                         Some(&notification_converter),
-                        download_cfg.process,
+                        &download_cfg.process,
                     )?;
                     &zst
                 }
@@ -424,7 +426,7 @@ impl Manifestation {
         new_manifest: &[String],
         update_hash: Option<&Path>,
         tmp_cx: &temp::Context,
-        notify_handler: &dyn Fn(Notification<'_>),
+        notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
         process: &Process,
     ) -> Result<Option<String>> {
         // If there's already a v2 installation then something has gone wrong
@@ -457,15 +459,15 @@ impl Manifestation {
         use std::path::PathBuf;
         let dld_dir = PathBuf::from("bogus");
         let dlcfg = DownloadCfg {
-            dist_root: "bogus",
-            download_dir: &dld_dir,
-            tmp_cx,
-            notify_handler,
-            process,
+            dist_root: "bogus".to_string(),
+            download_dir: dld_dir,
+            tmp_cx: Arc::new(tmp_cx.clone()),
+            //notify_handler,
+            process: Arc::new(process.clone()),
         };
 
         let dl = dlcfg
-            .download_and_check(&url, update_hash, ".tar.gz")
+            .download_and_check(&url, update_hash, ".tar.gz", notify_handler)
             .await?;
         if dl.is_none() {
             return Ok(None);
@@ -481,7 +483,7 @@ impl Manifestation {
         ));
 
         // Begin transaction
-        let mut tx = Transaction::new(prefix, tmp_cx, notify_handler, process);
+        let mut tx = Transaction::new(prefix, tmp_cx, &*notify_handler, process);
 
         // Uninstall components
         let components = self.installation.list()?;

@@ -7,6 +7,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{cmp, env};
 
@@ -128,14 +130,16 @@ pub(crate) fn read_line(process: &Process) -> Result<String> {
 
 pub(super) struct Notifier {
     tracker: Mutex<DownloadTracker>,
-    ram_notice_shown: RefCell<bool>,
+    //ram_notice_shown: RefCell<bool>,
+    ram_notice_shown: AtomicBool,
 }
 
 impl Notifier {
     pub(super) fn new(quiet: bool, process: &Process) -> Self {
         Self {
             tracker: Mutex::new(DownloadTracker::new_with_display_progress(!quiet, process)),
-            ram_notice_shown: RefCell::new(false),
+            //ram_notice_shown: RefCell::new(false),
+            ram_notice_shown: AtomicBool::new(false),
         }
     }
 
@@ -148,10 +152,10 @@ impl Notifier {
             util_notifications::Notification::SetDefaultBufferSize(_),
         )) = &n
         {
-            if *self.ram_notice_shown.borrow() {
+            if self.ram_notice_shown.load(Relaxed) {
                 return;
             } else {
-                *self.ram_notice_shown.borrow_mut() = true;
+                self.ram_notice_shown.store(true, Relaxed);
             }
         };
         let level = n.level();
@@ -178,13 +182,13 @@ impl Notifier {
 }
 
 #[tracing::instrument(level = "trace")]
-pub(crate) fn set_globals(current_dir: PathBuf, quiet: bool, process: &Process) -> Result<Cfg<'_>> {
+pub(crate) fn set_globals(current_dir: PathBuf, quiet: bool, process: &Process) -> Result<Cfg> {
     let notifier = Notifier::new(quiet, process);
-    Cfg::from_env(current_dir, Arc::new(move |n| notifier.handle(n)), process)
+    Cfg::from_env(current_dir, Arc::new(move |n| notifier.handle(n)), Arc::new(process.clone()))
 }
 
 pub(crate) fn show_channel_update(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     name: PackageUpdate,
     updated: Result<UpdateStatus>,
 ) -> Result<()> {
@@ -206,7 +210,7 @@ impl Display for PackageUpdate {
 }
 
 fn show_channel_updates(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     updates: Vec<(PackageUpdate, Result<UpdateStatus>)>,
 ) -> Result<()> {
     let data = updates.into_iter().map(|(pkg, result)| {
@@ -252,7 +256,7 @@ fn show_channel_updates(
         Ok((pkg, banner, width, color, version, previous_version))
     });
 
-    let mut t = cfg.process.stdout().terminal(cfg.process);
+    let mut t = cfg.process.stdout().terminal(&cfg.process);
 
     let data: Vec<_> = data.collect::<Result<_>>()?;
     let max_width = data
@@ -281,7 +285,7 @@ fn show_channel_updates(
 }
 
 pub(crate) async fn update_all_channels(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     do_self_update: bool,
     force_update: bool,
 ) -> Result<utils::ExitCode> {
@@ -307,7 +311,7 @@ pub(crate) async fn update_all_channels(
     };
 
     if do_self_update {
-        exit_code &= self_update(show_channel_updates, cfg.process).await?;
+        exit_code &= self_update(show_channel_updates, &cfg.process).await?;
     } else {
         show_channel_updates()?;
     }
@@ -407,7 +411,7 @@ pub(super) fn list_items(
 }
 
 pub(crate) fn list_toolchains(
-    cfg: &Cfg<'_>,
+    cfg: &Cfg,
     verbose: bool,
     quiet: bool,
 ) -> Result<utils::ExitCode> {
@@ -442,7 +446,7 @@ pub(crate) fn list_toolchains(
     }
 
     fn print_toolchain(
-        cfg: &Cfg<'_>,
+        cfg: &Cfg,
         toolchain: &str,
         is_default: bool,
         is_active: bool,
@@ -485,7 +489,7 @@ pub(crate) fn list_toolchains(
     Ok(utils::ExitCode(0))
 }
 
-pub(crate) fn list_overrides(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
+pub(crate) fn list_overrides(cfg: &Cfg) -> Result<utils::ExitCode> {
     let overrides = cfg.settings_file.with(|s| Ok(s.overrides.clone()))?;
 
     if overrides.is_empty() {

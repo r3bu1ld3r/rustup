@@ -99,7 +99,7 @@ pub(crate) struct InstallOpts<'a> {
 }
 
 impl<'a> InstallOpts<'a> {
-    fn install(self, cfg: &mut Cfg<'_>) -> Result<Option<ToolchainDesc>> {
+    fn install(self, cfg: &mut Cfg) -> Result<Option<ToolchainDesc>> {
         let Self {
             default_host_triple,
             default_toolchain,
@@ -977,8 +977,8 @@ pub(crate) fn uninstall(no_prompt: bool, process: &Process) -> Result<utils::Exi
 /// (and on windows this process will not be running to do it),
 /// rustup-init is stored in `CARGO_HOME`/bin, and then deleted next
 /// time rustup runs.
-pub(crate) async fn update(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
-    common::warn_if_host_is_emulated(cfg.process);
+pub(crate) async fn update(cfg: &Cfg) -> Result<utils::ExitCode> {
+    common::warn_if_host_is_emulated(&cfg.process);
 
     use common::SelfUpdatePermission::*;
     let update_permitted = if NEVER_SELF_UPDATE {
@@ -1001,7 +1001,7 @@ pub(crate) async fn update(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
         Permit => {}
     }
 
-    match prepare_update(cfg.process).await? {
+    match prepare_update(&cfg.process).await? {
         Some(setup_path) => {
             let Some(version) = get_and_parse_new_rustup_version(&setup_path) else {
                 error!("failed to get rustup version");
@@ -1022,7 +1022,7 @@ pub(crate) async fn update(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
                 Ok(UpdateStatus::Unchanged),
             );
             // Try again in case we emitted "tool `{}` is already installed" last time.
-            install_proxies(cfg.process)?
+            install_proxies(&cfg.process)?
         }
     }
 

@@ -1,7 +1,7 @@
 //! Installation from a Rust distribution server
 
 use std::{
-    collections::HashSet, env, fmt, io::Write, ops::Deref, path::Path, str::FromStr, sync::LazyLock,
+    collections::HashSet, env, fmt, io::Write, ops::Deref, path::Path, str::FromStr, sync::{Arc, LazyLock},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -817,11 +817,11 @@ impl fmt::Display for Profile {
 
 #[derive(Clone)]
 pub(crate) struct DistOptions<'a> {
-    pub(crate) cfg: &'a Cfg<'a>,
+    pub(crate) cfg: &'a Cfg,
     pub(crate) toolchain: &'a ToolchainDesc,
     pub(crate) profile: Profile,
     pub(crate) update_hash: Option<&'a Path>,
-    pub(crate) dl_cfg: DownloadCfg<'a>,
+    pub(crate) dl_cfg: DownloadCfg,
     /// --force bool is whether to force an update/install
     pub(crate) force: bool,
     /// --allow-downgrade
@@ -845,12 +845,13 @@ pub(crate) struct DistOptions<'a> {
 pub(crate) async fn update_from_dist(
     prefix: &InstallPrefix,
     opts: &DistOptions<'_>,
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
 ) -> Result<Option<String>> {
     let fresh_install = !prefix.path().exists();
     if let Some(hash) = opts.update_hash {
         // fresh_install means the toolchain isn't present, but hash_exists means there is a stray hash file
         if fresh_install && Path::exists(hash) {
-            (opts.dl_cfg.notify_handler)(Notification::StrayHash(hash));
+            (notify_handler)(Notification::StrayHash(hash));
             std::fs::remove_file(hash)?;
         }
     }
@@ -904,7 +905,7 @@ pub(crate) async fn update_from_dist(
     let mut toolchain = opts.toolchain.clone();
     let res = loop {
         let result = try_update_from_dist_(
-            opts.dl_cfg,
+            opts.dl_cfg.clone(),
             opts.update_hash,
             &toolchain,
             match opts.exists {
@@ -916,6 +917,7 @@ pub(crate) async fn update_from_dist(
             opts.components,
             opts.targets,
             &mut fetched,
+            notify_handler
         )
         .await;
 
@@ -928,7 +930,7 @@ pub(crate) async fn update_from_dist(
         let cause = e.downcast_ref::<DistError>();
         match cause {
             Some(DistError::ToolchainComponentsMissing(components, manifest, ..)) => {
-                (opts.dl_cfg.notify_handler)(Notification::SkippingNightlyMissingComponent(
+                (notify_handler)(Notification::SkippingNightlyMissingComponent(
                     &toolchain,
                     current_manifest.as_ref().unwrap_or(manifest),
                     components,
@@ -988,7 +990,7 @@ pub(crate) async fn update_from_dist(
     // Don't leave behind an empty / broken installation directory
     if res.is_err() && fresh_install {
         // FIXME Ignoring cascading errors
-        let _ = utils::remove_dir("toolchain", prefix.path(), opts.dl_cfg.notify_handler);
+        let _ = utils::remove_dir("toolchain", prefix.path(), &notify_handler);
     }
 
     res
@@ -996,7 +998,7 @@ pub(crate) async fn update_from_dist(
 
 #[allow(clippy::too_many_arguments)]
 async fn try_update_from_dist_(
-    download: DownloadCfg<'_>,
+    download: DownloadCfg,
     update_hash: Option<&Path>,
     toolchain: &ToolchainDesc,
     profile: Option<Profile>,
@@ -1005,14 +1007,16 @@ async fn try_update_from_dist_(
     components: &[&str],
     targets: &[&str],
     fetched: &mut String,
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
 ) -> Result<Option<String>> {
     let toolchain_str = toolchain.to_string();
     let manifestation = Manifestation::open(prefix.clone(), toolchain.target.clone())?;
+    let man_url = toolchain.manifest_v2_url(&download.dist_root, &download.process);
 
     // TODO: Add a notification about which manifest version is going to be used
-    (download.notify_handler)(Notification::DownloadingManifest(&toolchain_str));
-    match dl_v2_manifest(
-        download,
+    (notify_handler)(Notification::DownloadingManifest(&toolchain_str));
+    match dl_v3_manifest(
+        download.clone().into(),
         // Even if manifest has not changed, we must continue to install requested components.
         // So if components or targets is not empty, we skip passing `update_hash` so that
         // we essentially degenerate to `rustup component add` / `rustup target add`
@@ -1021,12 +1025,13 @@ async fn try_update_from_dist_(
         } else {
             None
         },
-        toolchain,
+        man_url,
+        notify_handler
     )
     .await
     {
         Ok(Some((m, hash))) => {
-            (download.notify_handler)(Notification::DownloadedManifest(
+            (notify_handler)(Notification::DownloadedManifest(
                 &m.date,
                 m.get_rust_version().ok(),
             ));
@@ -1085,6 +1090,7 @@ async fn try_update_from_dist_(
                     &download,
                     &toolchain.manifest_name(),
                     true,
+                    notify_handler
                 )
                 .await
             {
@@ -1112,7 +1118,7 @@ async fn try_update_from_dist_(
                 Some(RustupError::ChecksumFailed { .. }) => return Ok(None),
                 Some(RustupError::DownloadNotExists { .. }) => {
                     // Proceed to try v1 as a fallback
-                    (download.notify_handler)(Notification::DownloadingLegacyManifest)
+                    (notify_handler)(Notification::DownloadingLegacyManifest)
                 }
                 _ => return Err(err),
             }
@@ -1120,7 +1126,7 @@ async fn try_update_from_dist_(
     }
 
     // If the v2 manifest is not found then try v1
-    let manifest = match dl_v1_manifest(download, toolchain).await {
+    let manifest = match dl_v1_manifest(download.clone(), toolchain, notify_handler).await {
         Ok(m) => m,
         Err(err) => match err.downcast_ref::<RustupError>() {
             Some(RustupError::ChecksumFailed { .. }) => return Err(err),
@@ -1144,9 +1150,9 @@ async fn try_update_from_dist_(
         .update_v1(
             &manifest,
             update_hash,
-            download.tmp_cx,
-            &download.notify_handler,
-            download.process,
+            &download.tmp_cx,
+            notify_handler,
+            &download.process,
         )
         .await;
 
@@ -1162,14 +1168,14 @@ async fn try_update_from_dist_(
     result
 }
 
-pub(crate) async fn dl_v2_manifest(
-    download: DownloadCfg<'_>,
+pub(crate) async fn dl_v3_manifest(
+    download: Arc<DownloadCfg>,
     update_hash: Option<&Path>,
-    toolchain: &ToolchainDesc,
+    manifest_url: String,
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
 ) -> Result<Option<(ManifestV2, String)>> {
-    let manifest_url = toolchain.manifest_v2_url(download.dist_root, download.process);
     match download
-        .download_and_check(&manifest_url, update_hash, ".toml")
+        .download_and_check(&manifest_url, update_hash, ".toml", notify_handler)
         .await
     {
         Ok(manifest_dl) => {
@@ -1193,7 +1199,7 @@ pub(crate) async fn dl_v2_manifest(
                 // Manifest checksum mismatched.
                 warn!("{err}");
 
-                let server = dist_root_server(download.process)?;
+                let server = dist_root_server(&download.process)?;
                 if server == DEFAULT_DIST_SERVER {
                     info!("this is likely due to an ongoing update of the official release server, please try again later");
                     info!("see <https://github.com/rust-lang/rustup/issues/3390> for more details");
@@ -1207,11 +1213,58 @@ pub(crate) async fn dl_v2_manifest(
     }
 }
 
+
+//pub(crate) async fn dl_v2_manifest(
+//    download: DownloadCfg<'_>,
+//    update_hash: Option<&Path>,
+//    toolchain: &ToolchainDesc,
+//) -> Result<Option<(ManifestV2, String)>> {
+//    let manifest_url = toolchain.manifest_v2_url(download.dist_root, download.process);
+//    match download
+//        .download_and_check(&manifest_url, update_hash, ".toml")
+//        .await
+//    {
+//        Ok(manifest_dl) => {
+//            // Downloaded ok!
+//            let Some((manifest_file, manifest_hash)) = manifest_dl else {
+//                return Ok(None);
+//            };
+//            let manifest_str = utils::read_file("manifest", &manifest_file)?;
+//            let manifest =
+//                ManifestV2::parse(&manifest_str).with_context(|| RustupError::ParsingFile {
+//                    name: "manifest",
+//                    path: manifest_file.to_path_buf(),
+//                })?;
+//
+//            Ok(Some((manifest, manifest_hash)))
+//        }
+//        Err(any) => {
+//            if let Some(err @ RustupError::ChecksumFailed { .. }) =
+//                any.downcast_ref::<RustupError>()
+//            {
+//                // Manifest checksum mismatched.
+//                warn!("{err}");
+//
+//                let server = dist_root_server(download.process)?;
+//                if server == DEFAULT_DIST_SERVER {
+//                    info!("this is likely due to an ongoing update of the official release server, please try again later");
+//                    info!("see <https://github.com/rust-lang/rustup/issues/3390> for more details");
+//                } else {
+//                    info!("this might indicate an issue with the third-party release server '{server}'");
+//                    info!("see <https://github.com/rust-lang/rustup/issues/3885> for more details");
+//                }
+//            }
+//            Err(any)
+//        }
+//    }
+//}
+
 async fn dl_v1_manifest(
-    download: DownloadCfg<'_>,
+    download: DownloadCfg,
     toolchain: &ToolchainDesc,
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
 ) -> Result<Vec<String>> {
-    let root_url = toolchain.package_dir(download.dist_root);
+    let root_url = toolchain.package_dir(&download.dist_root);
 
     if let Channel::Version(ver) = &toolchain.channel {
         // This is an explicit version. In v1 there was no manifest,
@@ -1220,8 +1273,8 @@ async fn dl_v1_manifest(
         return Ok(vec![installer_name]);
     }
 
-    let manifest_url = toolchain.manifest_v1_url(download.dist_root, download.process);
-    let manifest_dl = download.download_and_check(&manifest_url, None, "").await?;
+    let manifest_url = toolchain.manifest_v1_url(&download.dist_root, &download.process);
+    let manifest_dl = download.download_and_check(&manifest_url, None, "", notify_handler).await?;
     let (manifest_file, _) = manifest_dl.unwrap();
     let manifest_str = utils::read_file("manifest", &manifest_file)?;
     let urls = manifest_str

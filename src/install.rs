@@ -25,12 +25,12 @@ pub(crate) enum InstallMethod<'a> {
     Copy {
         src: &'a Path,
         dest: &'a CustomToolchainName,
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
     },
     Link {
         src: &'a Path,
         dest: &'a CustomToolchainName,
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
     },
     Dist(DistOptions<'a>),
 }
@@ -79,7 +79,11 @@ impl<'a> InstallMethod<'a> {
         }
     }
 
-    async fn run(&self, path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<bool> {
+    async fn run(
+        &self,
+        path: &Path,
+        notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
+    ) -> Result<bool> {
         if path.exists() {
             // Don't uninstall first for Dist method
             match self {
@@ -101,7 +105,7 @@ impl<'a> InstallMethod<'a> {
             }
             InstallMethod::Dist(opts) => {
                 let prefix = &InstallPrefix::from(path.to_owned());
-                let maybe_new_hash = dist::update_from_dist(prefix, opts).await?;
+                let maybe_new_hash = dist::update_from_dist(prefix, opts, notify_handler).await?;
 
                 if let Some(hash) = maybe_new_hash {
                     if let Some(hash_file) = opts.update_hash {
@@ -116,7 +120,7 @@ impl<'a> InstallMethod<'a> {
         }
     }
 
-    fn cfg(&self) -> &Cfg<'_> {
+    fn cfg(&self) -> &Cfg {
         match self {
             InstallMethod::Copy { cfg, .. } => cfg,
             InstallMethod::Link { cfg, .. } => cfg,

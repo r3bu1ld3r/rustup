@@ -143,7 +143,7 @@ pub async fn download_file(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
-    notify_handler: &dyn Fn(Notification<'_>),
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
     process: &Process,
 ) -> Result<()> {
     download_file_with_resume(url, path, hasher, false, &notify_handler, process).await
@@ -154,7 +154,7 @@ pub(crate) async fn download_file_with_resume(
     path: &Path,
     hasher: Option<&mut Sha256>,
     resume_from_partial: bool,
-    notify_handler: &dyn Fn(Notification<'_>),
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
     process: &Process,
 ) -> Result<()> {
     use download::DownloadError as DEK;
@@ -202,24 +202,25 @@ async fn download_file_(
     path: &Path,
     hasher: Option<&mut Sha256>,
     resume_from_partial: bool,
-    notify_handler: &dyn Fn(Notification<'_>),
+    notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
     process: &Process,
 ) -> Result<()> {
     use download::download_to_path_with_backend;
     use download::{Backend, Event, TlsBackend};
+    use std::sync::{Arc, Mutex};
     use sha2::Digest;
     use std::cell::RefCell;
 
     notify_handler(Notification::DownloadingFile(url, path));
 
-    let hasher = RefCell::new(hasher);
+    let hasher = Arc::new(Mutex::new(hasher));
 
     // This callback will write the download to disk and optionally
     // hash the contents, then forward the notification up the stack
-    let callback: &dyn Fn(Event<'_>) -> download::Result<()> = &|msg| {
+    let callback: &(dyn Fn(Event<'_>) -> download::Result<()> + Send + Sync) = &|msg| {
         if let Event::DownloadDataReceived(data) = msg {
-            if let Some(h) = hasher.borrow_mut().as_mut() {
-                h.update(data);
+            if let Ok(mut guard) = hasher.lock() {
+                guard.as_mut().map(|h| h.update(data));
             }
         }
 

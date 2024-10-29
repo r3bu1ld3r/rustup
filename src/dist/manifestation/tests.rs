@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::{
@@ -462,7 +463,7 @@ impl TestContext {
             dist_root: "phony",
             tmp_cx: &self.tmp_cx,
             download_dir: &self.download_dir,
-            notify_handler: &|event| println!("{event}"),
+            //notify_handler: &|event| println!("{event}"),
             process: &self.tp.process,
         }
     }
@@ -477,7 +478,10 @@ impl TestContext {
         remove: &[Component],
         force: bool,
     ) -> Result<UpdateStatus> {
-        self.update_from_dist_with_dl_cfg(add, remove, force, &self.default_dl_cfg())
+        let notify_handler = |n: Notification<'_>| {
+            println!("{:?}", n);
+        };
+        self.update_from_dist_with_dl_cfg(add, remove, force, &self.default_dl_cfg(), &notify_handler)
             .await
     }
 
@@ -487,6 +491,7 @@ impl TestContext {
         remove: &[Component],
         force: bool,
         dl_cfg: &DownloadCfg<'_>,
+        notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync),
     ) -> Result<UpdateStatus> {
         // Download the dist manifest and place it into the installation prefix
         let manifest_url = make_manifest_url(&self.url, &self.toolchain)?;
@@ -517,6 +522,7 @@ impl TestContext {
                 dl_cfg,
                 &self.toolchain.manifest_name(),
                 true,
+                notify_handler
             )
             .await
     }
@@ -1447,22 +1453,28 @@ async fn reuse_downloaded_file() {
     prevent_installation(&cx.prefix);
 
     let reuse_notification_fired = Arc::new(Cell::new(false));
-    let dl_cfg = DownloadCfg {
-        notify_handler: &|n| {
+    let notify_handler = &|n| {
             if let Notification::FileAlreadyDownloaded = n {
                 reuse_notification_fired.set(true);
             }
-        },
+        };
+
+    let dl_cfg = DownloadCfg {
+        //notify_handler: &|n| {
+        //    if let Notification::FileAlreadyDownloaded = n {
+        //        reuse_notification_fired.set(true);
+        //    }
+        //},
         ..cx.default_dl_cfg()
     };
 
-    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg)
+    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg, notify_handler)
         .await
         .unwrap_err();
     assert!(!reuse_notification_fired.get());
 
     allow_installation(&cx.prefix);
-    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg)
+    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg, notify_handler)
         .await
         .unwrap();
 

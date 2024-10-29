@@ -128,7 +128,7 @@ enum OverrideCfg {
 }
 
 impl OverrideCfg {
-    fn from_file(cfg: &Cfg<'_>, file: OverrideFile) -> Result<Self> {
+    fn from_file(cfg: &Cfg, file: OverrideFile) -> Result<Self> {
         let toolchain_name = match (file.toolchain.channel, file.toolchain.path) {
             (Some(name), None) => {
                 ResolvableToolchainName::try_from(name)?.resolve(&cfg.get_default_host_triple()?)?
@@ -161,7 +161,7 @@ impl OverrideCfg {
             }
             (None, None) => cfg
                 .get_default()?
-                .ok_or_else(|| no_toolchain_error(cfg.process))?,
+                .ok_or_else(|| no_toolchain_error(&cfg.process))?,
         };
         Ok(match toolchain_name {
             ToolchainName::Official(desc) => {
@@ -229,7 +229,7 @@ impl From<LocalToolchainName> for OverrideCfg {
 #[cfg(unix)]
 pub(crate) const UNIX_FALLBACK_SETTINGS: &str = "/etc/rustup/settings.toml";
 
-pub(crate) struct Cfg<'a> {
+pub(crate) struct Cfg {
     profile_override: Option<Profile>,
     pub rustup_dir: PathBuf,
     pub settings_file: SettingsFile,
@@ -241,16 +241,16 @@ pub(crate) struct Cfg<'a> {
     pub toolchain_override: Option<ResolvableToolchainName>,
     pub env_override: Option<LocalToolchainName>,
     pub dist_root_url: String,
-    pub notify_handler: Arc<dyn Fn(Notification<'_>)>,
+    pub notify_handler: Arc<dyn Fn(Notification<'_>) + Send + Sync>,
     pub current_dir: PathBuf,
-    pub process: &'a Process,
+    pub process: Arc<Process>,
 }
 
-impl<'a> Cfg<'a> {
+impl Cfg {
     pub(crate) fn from_env(
         current_dir: PathBuf,
-        notify_handler: Arc<dyn Fn(Notification<'_>)>,
-        process: &'a Process,
+        notify_handler: Arc<dyn Fn(Notification<'_>) + Send + Sync>,
+        process: Arc<Process>,
     ) -> Result<Self> {
         // Set up the rustup home directory
         let rustup_dir = process.rustup_home()?;
@@ -288,15 +288,15 @@ impl<'a> Cfg<'a> {
 
         // Figure out get_default_host_triple before Config is populated
         let default_host_triple =
-            settings_file.with(|s| Ok(get_default_host_triple(s, process)))?;
+            settings_file.with(|s| Ok(get_default_host_triple(s, &process)))?;
         // Environment override
-        let env_override = non_empty_env_var("RUSTUP_TOOLCHAIN", process)?
+        let env_override = non_empty_env_var("RUSTUP_TOOLCHAIN", &process)?
             .map(ResolvableLocalToolchainName::try_from)
             .transpose()?
             .map(|t| t.resolve(&default_host_triple))
             .transpose()?;
 
-        let dist_root_server = dist_root_server(process)?;
+        let dist_root_server = dist_root_server(&process)?;
 
         let notify_clone = notify_handler.clone();
         let tmp_cx = temp::Context::new(
@@ -335,18 +335,32 @@ impl<'a> Cfg<'a> {
     }
 
     /// construct a download configuration
-    pub(crate) fn download_cfg(
-        &'a self,
-        notify_handler: &'a dyn Fn(crate::dist::Notification<'_>),
-    ) -> DownloadCfg<'a> {
+    pub(crate) fn download_cfg_v2(
+        &self,
+        //notify_handler: &'a dyn Fn(crate::dist::Notification<'_>),
+    ) -> DownloadCfg {
         DownloadCfg {
-            dist_root: &self.dist_root_url,
-            tmp_cx: &self.tmp_cx,
-            download_dir: &self.download_dir,
-            notify_handler,
-            process: self.process,
+            dist_root: self.dist_root_url.to_owned(),
+            tmp_cx: Arc::new(self.tmp_cx.clone()),
+            download_dir: self.download_dir.clone(),
+            //notify_handler,
+            process: self.process.clone(),
         }
     }
+    
+    
+    //pub(crate) fn download_cfg<'a>(
+    //    &'a self,
+    //    notify_handler: &'a( dyn Fn(crate::dist::Notification<'_>) + Send + Sync),
+    //) -> DownloadCfg<'a> {
+    //    DownloadCfg {
+    //        dist_root: &self.dist_root_url,
+    //        tmp_cx: &self.tmp_cx,
+    //        download_dir: &self.download_dir,
+    //        //notify_handler,
+    //        process: &self.process,
+    //    }
+    //}
 
     pub(crate) fn set_profile_override(&mut self, profile: Profile) {
         self.profile_override = Some(profile);
@@ -575,7 +589,7 @@ impl<'a> Cfg<'a> {
                 // have an unresolved name. I'm just preserving pre-existing
                 // behaviour by choosing ResolvableToolchainName here.
                 let toolchain_name = ResolvableToolchainName::try_from(name)?
-                    .resolve(&get_default_host_triple(settings, self.process))?;
+                    .resolve(&get_default_host_triple(settings, &self.process))?;
                 let override_cfg = toolchain_name.into();
                 return Ok(Some((override_cfg, reason)));
             }
@@ -620,7 +634,7 @@ impl<'a> Cfg<'a> {
                     })?;
                 if let Some(toolchain_name_str) = &override_file.toolchain.channel {
                     let toolchain_name = ResolvableToolchainName::try_from(toolchain_name_str)?;
-                    let default_host_triple = get_default_host_triple(settings, self.process);
+                    let default_host_triple = get_default_host_triple(settings, &self.process);
                     // Do not permit architecture/os selection in channels as
                     // these are host specific and toolchain files are portable.
                     if let ResolvableToolchainName::Official(ref name) = toolchain_name {
@@ -696,7 +710,8 @@ impl<'a> Cfg<'a> {
 
     #[tracing::instrument(level = "trace")]
     pub(crate) fn active_rustc_version(&mut self) -> Result<Option<String>> {
-        if let Some(t) = self.process.args().find(|x| x.starts_with('+')) {
+        let process = self.process.clone();
+        if let Some(t) = process.args().find(|x| x.starts_with('+')) {
             trace!("Fetching rustc version from toolchain `{}`", t);
             self.set_toolchain_override(&ResolvableToolchainName::try_from(&t[1..])?);
         }
@@ -732,7 +747,7 @@ impl<'a> Cfg<'a> {
             Some(tc) => tc,
             None => {
                 self.find_active_toolchain()?
-                    .ok_or_else(|| no_toolchain_error(self.process))?
+                    .ok_or_else(|| no_toolchain_error(&self.process))?
                     .0
             }
         };
@@ -777,7 +792,7 @@ impl<'a> Cfg<'a> {
             }
             Ok((toolchain.into(), reason))
         } else {
-            Err(no_toolchain_error(self.process))
+            Err(no_toolchain_error(&self.process))
         }
     }
 
@@ -795,7 +810,7 @@ impl<'a> Cfg<'a> {
     ) -> Result<(UpdateStatus, Toolchain<'_>)> {
         common::check_non_host_toolchain(
             toolchain.to_string(),
-            &TargetTriple::from_host_or_build(self.process),
+            &TargetTriple::from_host_or_build(&self.process),
             &toolchain.target,
             force_non_host,
         )?;
@@ -881,6 +896,26 @@ impl<'a> Cfg<'a> {
             Ok(Vec::new())
         }
     }
+    
+    pub(crate) fn list_channels_v2(&self) -> Result<Vec<(ToolchainDesc, DistributableToolchain<'_>)>> {
+        self.list_toolchains()?
+            .into_iter()
+            .filter_map(|t| {
+                if let ToolchainName::Official(desc) = t {
+                    Some(desc)
+                } else {
+                    None
+                }
+            })
+            .filter(ToolchainDesc::is_tracking)
+            .map(|n| {
+                DistributableToolchain::new(self, n.clone())
+                    .map_err(Into::into)
+                    .map(|t| (n.clone(), t))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+    
 
     pub(crate) fn list_channels(&self) -> Result<Vec<(ToolchainDesc, DistributableToolchain<'_>)>> {
         self.list_toolchains()?
@@ -946,7 +981,7 @@ impl<'a> Cfg<'a> {
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn get_default_host_triple(&self) -> Result<TargetTriple> {
         self.settings_file
-            .with(|s| Ok(get_default_host_triple(s, self.process)))
+            .with(|s| Ok(get_default_host_triple(s, &self.process)))
     }
 
     /// The path on disk of any concrete toolchain
@@ -976,7 +1011,7 @@ pub(crate) fn dist_root_server(process: &Process) -> Result<String> {
     })
 }
 
-impl<'a> Debug for Cfg<'a> {
+impl Debug for Cfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             profile_override,

@@ -1,6 +1,7 @@
 use std::fs;
 use std::ops;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -14,13 +15,22 @@ use crate::utils::utils;
 
 const UPDATE_HASH_LEN: usize = 20;
 
-#[derive(Copy, Clone)]
-pub struct DownloadCfg<'a> {
-    pub dist_root: &'a str,
-    pub tmp_cx: &'a temp::Context,
-    pub download_dir: &'a PathBuf,
-    pub notify_handler: &'a dyn Fn(Notification<'_>),
-    pub process: &'a Process,
+//#[derive(Clone)]
+//pub struct DownloadCfg<'a> {
+//    pub dist_root: &'a str,
+//    pub tmp_cx: &'a temp::Context,
+//    pub download_dir: &'a PathBuf,
+//    //pub notify_handler: &'a dyn Fn(Notification<'_>),
+//    pub process: &'a Process,
+//}
+
+#[derive(Clone)]
+pub struct DownloadCfg {
+    pub dist_root: String,
+    pub tmp_cx: Arc<temp::Context>,
+    pub download_dir: PathBuf,
+    //pub notify_handler: &'a dyn Fn(Notification<'_>),
+    pub process: Arc<Process>,
 }
 
 pub(crate) struct File {
@@ -35,27 +45,27 @@ impl ops::Deref for File {
     }
 }
 
-impl<'a> DownloadCfg<'a> {
+impl DownloadCfg {
     /// Downloads a file and validates its hash. Resumes interrupted downloads.
     /// Partial downloads are stored in `self.download_dir`, keyed by hash. If the
     /// target file already exists, then the hash is checked and it is returned
     /// immediately without re-downloading.
-    pub(crate) async fn download(&self, url: &Url, hash: &str) -> Result<File> {
+    pub(crate) async fn download(&self, url: &Url, hash: &str, notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync)) -> Result<File> {
         utils::ensure_dir_exists(
             "Download Directory",
-            self.download_dir,
-            &self.notify_handler,
+            &self.download_dir,
+            notify_handler,
         )?;
         let target_file = self.download_dir.join(Path::new(hash));
 
         if target_file.exists() {
-            let cached_result = file_hash(&target_file, self.notify_handler)?;
+            let cached_result = file_hash(&target_file, notify_handler)?;
             if hash == cached_result {
-                (self.notify_handler)(Notification::FileAlreadyDownloaded);
-                (self.notify_handler)(Notification::ChecksumValid(url.as_ref()));
+                (notify_handler)(Notification::FileAlreadyDownloaded);
+                (notify_handler)(Notification::ChecksumValid(url.as_ref()));
                 return Ok(File { path: target_file });
             } else {
-                (self.notify_handler)(Notification::CachedFileChecksumFailed);
+                (notify_handler)(Notification::CachedFileChecksumFailed);
                 fs::remove_file(&target_file).context("cleaning up previous download")?;
             }
         }
@@ -78,8 +88,8 @@ impl<'a> DownloadCfg<'a> {
             &partial_file_path,
             Some(&mut hasher),
             true,
-            &|n| (self.notify_handler)(n.into()),
-            self.process,
+            &|n| (notify_handler)(n.into()),
+            &self.process,
         )
         .await
         {
@@ -107,14 +117,14 @@ impl<'a> DownloadCfg<'a> {
                 .into())
             }
         } else {
-            (self.notify_handler)(Notification::ChecksumValid(url.as_ref()));
+            (notify_handler)(Notification::ChecksumValid(url.as_ref()));
 
             utils::rename(
                 "downloaded",
                 &partial_file_path,
                 &target_file,
-                self.notify_handler,
-                self.process,
+                notify_handler,
+                &self.process,
             )?;
             Ok(File { path: target_file })
         }
@@ -130,7 +140,7 @@ impl<'a> DownloadCfg<'a> {
         Ok(())
     }
 
-    async fn download_hash(&self, url: &str) -> Result<String> {
+    async fn download_hash(&self, url: &str, notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync)) -> Result<String> {
         let hash_url = utils::parse_url(&(url.to_owned() + ".sha256"))?;
         let hash_file = self.tmp_cx.new_file()?;
 
@@ -138,8 +148,8 @@ impl<'a> DownloadCfg<'a> {
             &hash_url,
             &hash_file,
             None,
-            &|n| (self.notify_handler)(n.into()),
-            self.process,
+            &|n| (notify_handler)(n.into()),
+            &self.process,
         )
         .await?;
 
@@ -156,8 +166,9 @@ impl<'a> DownloadCfg<'a> {
         url_str: &str,
         update_hash: Option<&Path>,
         ext: &str,
-    ) -> Result<Option<(temp::File<'a>, String)>> {
-        let hash = self.download_hash(url_str).await?;
+        notify_handler: &(dyn Fn(Notification<'_>) + Send + Sync)
+    ) -> Result<Option<(temp::File<'_>, String)>> {
+        let hash = self.download_hash(url_str, notify_handler).await?;
         let partial_hash: String = hash.chars().take(UPDATE_HASH_LEN).collect();
 
         if let Some(hash_file) = update_hash {
@@ -168,10 +179,10 @@ impl<'a> DownloadCfg<'a> {
                         return Ok(None);
                     }
                 } else {
-                    (self.notify_handler)(Notification::CantReadUpdateHash(hash_file));
+                    (notify_handler)(Notification::CantReadUpdateHash(hash_file));
                 }
             } else {
-                (self.notify_handler)(Notification::NoUpdateHash(hash_file));
+                (notify_handler)(Notification::NoUpdateHash(hash_file));
             }
         }
 
@@ -183,8 +194,8 @@ impl<'a> DownloadCfg<'a> {
             &url,
             &file,
             Some(&mut hasher),
-            &|n| (self.notify_handler)(n.into()),
-            self.process,
+            &|n| (notify_handler)(n.into()),
+            &self.process,
         )
         .await?;
         let actual_hash = format!("{:x}", hasher.finalize());
@@ -198,7 +209,7 @@ impl<'a> DownloadCfg<'a> {
             }
             .into());
         } else {
-            (self.notify_handler)(Notification::ChecksumValid(url_str));
+            (notify_handler)(Notification::ChecksumValid(url_str));
         }
 
         Ok(Some((file, partial_hash)))

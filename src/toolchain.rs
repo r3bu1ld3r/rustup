@@ -1,13 +1,5 @@
 use std::{
-    env::{self, consts::EXE_SUFFIX},
-    ffi::{OsStr, OsString},
-    fmt::Debug,
-    fs,
-    io::{self, BufRead, BufReader},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    str::FromStr,
-    time::Duration,
+    env::{self, consts::EXE_SUFFIX}, ffi::{OsStr, OsString}, fmt::Debug, fs, io::{self, BufRead, BufReader}, path::{Path, PathBuf}, process::{Command, Stdio}, str::FromStr, sync::Arc, time::Duration
 };
 
 use anyhow::{anyhow, bail};
@@ -37,7 +29,7 @@ pub(crate) use names::{
 /// A toolchain installed on the local disk
 #[derive(Clone, Debug)]
 pub(crate) struct Toolchain<'a> {
-    pub(super) cfg: &'a Cfg<'a>,
+    pub(super) cfg: &'a Cfg,
     name: LocalToolchainName,
     path: PathBuf,
 }
@@ -46,7 +38,7 @@ impl<'a> Toolchain<'a> {
     pub(crate) async fn from_local(
         name: LocalToolchainName,
         install_if_missing: bool,
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
     ) -> anyhow::Result<Toolchain<'a>> {
         match Self::new(cfg, name) {
             Ok(tc) => Ok(tc),
@@ -67,7 +59,7 @@ impl<'a> Toolchain<'a> {
     /// Calls Toolchain::new(), but augments the error message with more context
     /// from the ActiveReason if the toolchain isn't installed.
     pub(crate) fn with_reason(
-        cfg: &'a Cfg<'a>,
+        cfg: &'a Cfg,
         name: LocalToolchainName,
         reason: &ActiveReason,
     ) -> anyhow::Result<Self> {
@@ -102,7 +94,7 @@ impl<'a> Toolchain<'a> {
         Err(anyhow!(reason_err).context(format!("override toolchain '{name}' is not installed")))
     }
 
-    pub(crate) fn new(cfg: &'a Cfg<'a>, name: LocalToolchainName) -> Result<Self, RustupError> {
+    pub(crate) fn new(cfg: &'a Cfg, name: LocalToolchainName) -> Result<Self, RustupError> {
         let path = cfg.toolchain_path(&name);
         if !Toolchain::exists(cfg, &name)? {
             return Err(match name {
@@ -115,7 +107,7 @@ impl<'a> Toolchain<'a> {
 
     /// Ok(True) if the toolchain exists. Ok(False) if the toolchain or its
     /// containing directory don't exist. Err otherwise.
-    pub(crate) fn exists(cfg: &Cfg<'_>, name: &LocalToolchainName) -> Result<bool, RustupError> {
+    pub(crate) fn exists(cfg: &Cfg, name: &LocalToolchainName) -> Result<bool, RustupError> {
         let path = cfg.toolchain_path(name);
         // toolchain validation should have prevented a situation where there is
         // no base dir, but defensive programming is defensive.
@@ -167,7 +159,7 @@ impl<'a> Toolchain<'a> {
             cmd.env("CARGO_HOME", &cargo_home);
         }
 
-        env_var::inc("RUST_RECURSION_COUNT", cmd, self.cfg.process);
+        env_var::inc("RUST_RECURSION_COUNT", cmd, &self.cfg.process);
 
         cmd.env("RUSTUP_TOOLCHAIN", format!("{}", self.name));
         cmd.env("RUSTUP_HOME", &self.cfg.rustup_dir);
@@ -216,7 +208,7 @@ impl<'a> Toolchain<'a> {
             new_path.push(PathBuf::from("/usr/lib"));
         }
 
-        env_var::prepend_path(sysenv::LOADER_PATH, new_path, cmd, self.cfg.process);
+        env_var::prepend_path(sysenv::LOADER_PATH, new_path, cmd, &self.cfg.process);
 
         // Prepend CARGO_HOME/bin to the PATH variable so that we're sure to run
         // cargo/rustc via the proxy bins. There is no fallback case for if the
@@ -250,7 +242,7 @@ impl<'a> Toolchain<'a> {
             path_entries.push(self.path.join("bin"));
         }
 
-        env_var::prepend_path("PATH", path_entries, cmd, self.cfg.process);
+        env_var::prepend_path("PATH", path_entries, cmd, &self.cfg.process);
     }
 
     /// Infallible function that describes the version of rustc in an installed distribution
@@ -426,7 +418,7 @@ impl<'a> Toolchain<'a> {
     /// Remove the toolchain from disk
     ///
     ///
-    pub fn ensure_removed(cfg: &Cfg<'_>, name: LocalToolchainName) -> anyhow::Result<()> {
+    pub fn ensure_removed(cfg: &Cfg, name: LocalToolchainName) -> anyhow::Result<()> {
         let path = cfg.toolchain_path(&name);
         let name = match name {
             LocalToolchainName::Named(t) => t,
